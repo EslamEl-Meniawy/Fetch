@@ -100,6 +100,7 @@ public final class FetchService extends Service implements FetchConst {
     private volatile boolean fetchRunnableQueued = false;
     private volatile boolean removingRequest = false;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final List<BroadcastReceiver> registeredReceivers = new ArrayList<>();
 
     public static void sendToService(@NonNull Context context,@Nullable Bundle extras) {
 
@@ -152,6 +153,17 @@ public final class FetchService extends Service implements FetchConst {
         sharedPreferences = getSharedPreferences(SHARED_PREFERENCES,Context.MODE_PRIVATE);
         databaseHelper = DatabaseHelper.getInstance(context);
         broadcastManager.registerReceiver(fetchDoneReceiver,FetchRunnable.getDoneFilter());
+        registeredReceivers.add(fetchDoneReceiver);
+
+
+        if(!executor.isShutdown()) {
+            executor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    databaseHelper.clean();
+                }
+            });
+        }
     }
 
     @Nullable
@@ -182,7 +194,11 @@ public final class FetchService extends Service implements FetchConst {
             fetchRunnable.setInterrupted(true);
         }
 
-        broadcastManager.unregisterReceiver(fetchDoneReceiver);
+        for (BroadcastReceiver registeredReceiver : registeredReceivers) {
+            broadcastManager.unregisterReceiver(registeredReceiver);
+        }
+
+        registeredReceivers.clear();
     }
 
     private void processAction(final Intent intent) {
@@ -323,10 +339,9 @@ public final class FetchService extends Service implements FetchConst {
             String headerString = Utils.bundleListToHeaderString(headers);
             long fileSize = 0L;
             long downloadedBytes = 0L;
-            int error = DEFAULT_EMPTY_VALUE;
 
-           boolean enqueued = databaseHelper.insert(id,url,filePath,STATUS_QUEUED,headerString,
-                    downloadedBytes,fileSize,priority,error);
+            boolean enqueued = databaseHelper.insert(id,url,filePath,STATUS_QUEUED,headerString,
+                    downloadedBytes,fileSize,priority, DEFAULT_EMPTY_VALUE);
 
             if(!enqueued) {
                 throw new EnqueueException("could not enqueue request",ERROR_ENQUEUE_ERROR);
@@ -346,6 +361,10 @@ public final class FetchService extends Service implements FetchConst {
     }
 
     private void resume(final long id) {
+
+        if(fetchRunnable != null && fetchRunnable.getId() == id) {
+            return;
+        }
 
         boolean resumed = databaseHelper.resume(id);
 
@@ -368,23 +387,42 @@ public final class FetchService extends Service implements FetchConst {
 
     private void pause(final long id) {
 
-        if(fetchRunnable != null && fetchRunnable.getId() == id) {
+        final boolean paused = databaseHelper.pause(id);
+
+        if(paused && fetchRunnable != null && fetchRunnable.getId() == id) {
+
+            BroadcastReceiver broadcastReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+
+                    if(intent != null && FetchRunnable.getId(intent) == id) {
+
+                        try {
+
+                            Cursor cursor = databaseHelper.get(id);
+                            RequestInfo requestInfo = Utils.cursorToRequestInfo(cursor,true);
+
+                            if(requestInfo != null) {
+                                Utils.sendEventUpdate(broadcastManager, requestInfo.getId(),
+                                        requestInfo.getStatus(), requestInfo.getProgress(),
+                                        requestInfo.getDownloadedBytes(),requestInfo.getFileSize(),
+                                        requestInfo.getError());
+                            }
+
+                        }catch (Exception e) {
+                            e.printStackTrace();
+                        }
+                    }
+
+                    broadcastManager.unregisterReceiver(this);
+                    registeredReceivers.remove(this);
+                }
+            };
+
+
+            registeredReceivers.add(broadcastReceiver);
+            broadcastManager.registerReceiver(broadcastReceiver,FetchRunnable.getDoneFilter());
             fetchRunnable.setInterrupted(true);
-        }
-
-        boolean paused = databaseHelper.pause(id);
-
-        if(paused) {
-
-            Cursor cursor = databaseHelper.get(id);
-            RequestInfo requestInfo = Utils.cursorToRequestInfo(cursor,true);
-
-            if(requestInfo != null) {
-                Utils.sendEventUpdate(broadcastManager, requestInfo.getId(),
-                        requestInfo.getStatus(), requestInfo.getProgress(),
-                        requestInfo.getDownloadedBytes(),requestInfo.getFileSize(),
-                        requestInfo.getError());
-            }
         }
 
         startDownload();
@@ -493,9 +531,13 @@ public final class FetchService extends Service implements FetchConst {
 
     private void retry(long id) {
 
-        boolean willRetry = databaseHelper.retry(id);
+        if(fetchRunnable != null && fetchRunnable.getId() == id) {
+            return;
+        }
 
-        if(willRetry) {
+        boolean retry = databaseHelper.retry(id);
+
+        if(retry) {
 
             Cursor cursor = databaseHelper.get(id);
             RequestInfo requestInfo = Utils.cursorToRequestInfo(cursor,true);
